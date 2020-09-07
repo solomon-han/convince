@@ -1,3 +1,5 @@
+# Trainer for Hotpot Reader ver1
+# /convince/allennlp/allennlp/training/trainer.py
 import copy
 import logging
 import math
@@ -8,6 +10,7 @@ import re
 import datetime
 import traceback
 import warnings
+import csv
 from typing import Dict, Optional, List, Tuple, Union, Iterable, Any, NamedTuple
 
 import torch
@@ -258,12 +261,12 @@ class Trainer(TrainerBase):
         self._batch_num_total = 0
 
         self._tensorboard = TensorboardWriter(
-                get_batch_num_total=lambda: self._batch_num_total,
-                serialization_dir=serialization_dir,
-                summary_interval=summary_interval,
-                histogram_interval=histogram_interval,
-                should_log_parameter_statistics=should_log_parameter_statistics,
-                should_log_learning_rate=should_log_learning_rate)
+            get_batch_num_total=lambda: self._batch_num_total,
+            serialization_dir=serialization_dir,
+            summary_interval=summary_interval,
+            histogram_interval=histogram_interval,
+            should_log_parameter_statistics=should_log_parameter_statistics,
+            should_log_learning_rate=should_log_learning_rate)
 
         self._log_batch_size_period = log_batch_size_period
 
@@ -499,6 +502,10 @@ class Trainer(TrainerBase):
                 print('\n**Answers**\n', [answer if isinstance(answer, str) else ' '.join(answer)
                                           for answer in batch['metadata'][i]['answer_texts']])
 
+            # Setup evidence index lists
+            ev_idx_label_list = batch['metadata'][i]['ev_idx_label_list']
+            ev_idx_pred_list = []
+
             # Pretty print prior (if applicable)
             if ver_dict_prior is not None:
                 if 'prob_dist' in ver_dict_prior:
@@ -513,12 +520,13 @@ class Trainer(TrainerBase):
                     sent_str = None
                     if len(turn_sent_idxs['output']) > 0:
                         sent_str = ' '.join(toks[turn_sent_idxs['output'].min(): turn_sent_idxs['output'].max() + 1])
-                    self._debate_logs[qid]['sentences_chosen'].append(sent_str)
-                    stance_str = str(stances[method][i].nonzero().item()) \
-                        if method.lower() in {'e', 'l', 'w'} else method
-                    self._debate_logs[qid]['stances'].append(stance_str)
-                    print('\n**' + method + '**', '*(Stance: ' + stance_str + ')*',
-                          ': Sentence', int(sent_choice_idxs[turn_no][i]), '\n', sent_str)
+                        self._debate_logs[qid]['sentences_chosen'].append(sent_str)
+                        stance_str = str(stances[method][i].nonzero().item()) \
+                            if method.lower() in {'e', 'l', 'w'} else method
+                        self._debate_logs[qid]['stances'].append(stance_str)
+                        print('\n**' + method + '**', '*(Stance: ' + stance_str + ')*',
+                              ': Sentence', int(sent_choice_idxs[turn_no][i]), '\n', sent_str)
+                        ev_idx_pred_list.append(int(sent_choice_idxs[turn_no][i]))
                 print('\n**J**:')
                 if advantage is not None:
                     self._debate_logs[qid]['advantage'] = float(advantage[i])
@@ -529,6 +537,47 @@ class Trainer(TrainerBase):
                     if ver_dicts[round_no].get(k) is not None:
                         self._debate_logs[qid][k] = ver_dicts[round_no][k][i].item()
                 turns_completed += len(round_methods)
+            # print num_sents (for Debugging)
+            print('num_sents', int(num_sents.float()))
+            print('max_pred_num', len(debate_mode))
+            # csv output for evidence sentence (ver1)
+            if not os.path.exists('/content/evidence_output.csv'):
+                with open('/content/evidence_output.csv', 'w', encoding='utf-8', newline='') as f:
+                    wr = csv.writer(f)
+                    wr.writerow(['qid', 'passage', 'question', 'f1', 'recall', 'precision', 'ev_num diff (label-pred)',
+                                 'num_sents', 'ev_label_idxs', 'num_label_valid','valid_acc'])
+                    f.close()
+            with open('/content/evidence_output.csv', 'a', encoding='utf-8', newline='') as f:
+                wr = csv.writer(f)
+                ev_label_set = set(ev_idx_label_list)
+                ev_pred_set = set(ev_idx_pred_list)
+                num_true_pred = len(ev_label_set & ev_pred_set)
+                if len(ev_label_set) > 0:
+                    recall = num_true_pred / len(ev_label_set)
+                else:
+                    recall = 'NaN'
+                precision = num_true_pred / len(ev_pred_set)
+                if recall != 0 or precision != 0:
+                    f1 = (2 * recall * precision) / (recall + precision)
+                else:
+                    f1 = 'NaN'
+                ev_num_diff = len(ev_label_set) - len(ev_pred_set)
+                sorted_idx = sorted(list(ev_label_set))
+                ev_label_idxs = ", ".join(map(lambda x: str(x), sorted_idx))
+                max_pred_num = len(debate_mode)
+                num_sents_int = int(num_sents.float())
+                num_ev_reachable = len(list(filter(lambda x:x<num_sents_int, list(ev_idx_label_list))))
+                num_valid = min([max_pred_num, num_ev_reachable])
+                if num_valid >0:
+                  valid_acc = num_true_pred/num_valid
+                else:
+                  valid_acc = 'NaN'
+                # Write csv row
+                row = [qid, passage, question, f1, recall, precision, ev_num_diff, num_sents_int, ' ' +ev_label_idxs, num_valid, valid_acc]
+                print('num_valid: ', num_valid , '\nvalid_acc: ',row[-1])
+                wr.writerow(row
+                    )
+                f.close()
         return
 
     def _print_tokens(self, tokens) -> None:
@@ -580,7 +629,8 @@ class Trainer(TrainerBase):
 
     def _get_search_output_dict(self, batch: TensorDict, sent_idxs: TensorDict, judge_answer_mask: TensorDict,
                                 required_text_mask: TensorDict, past_sent_choice_idxs: List[torch.Tensor],
-                                num_sents: torch.Tensor, sample_no: int, debate_mode: List[str], round_no: int) -> TensorDict:
+                                num_sents: torch.Tensor, sample_no: int, debate_mode: List[str],
+                                round_no: int) -> TensorDict:
         """
         Returns the output dict from running all possible decisions on the Judge. Used to get search decisions.
         Batches together all possible next outcomes for one sample.
@@ -665,8 +715,8 @@ class Trainer(TrainerBase):
                                     past_sent_choice_idxs: List[torch.Tensor], stance: torch.Tensor,
                                     sent_answer_idx: torch.Tensor, num_sents: torch.Tensor, turn_str: str,
                                     for_training: bool, method: str, debate_mode: List[str], round_no: int) -> Tuple[
-                                    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
-                                    List[torch.Tensor]]:
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+        List[torch.Tensor]]:
         """
         Returns the sentence chosen by a particular policy.
         """
@@ -696,7 +746,8 @@ class Trainer(TrainerBase):
             judge.eval()
             for sample_no in range(bsz):
                 search_output_dict = self._get_search_output_dict(batch, sent_idxs, judge_answer_mask,
-                    required_text_mask, past_sent_choice_idxs, num_sents, sample_no, debate_mode, round_no)
+                                                                  required_text_mask, past_sent_choice_idxs, num_sents,
+                                                                  sample_no, debate_mode, round_no)
                 search_metrics = self._get_reward(search_output_dict, stance[sample_no].unsqueeze(0), method, 'prob')
                 if self._require_action and (past_sent_choice_idxs is not None):
                     search_metrics_for_valid_actions = search_metrics.clone()
@@ -741,7 +792,8 @@ class Trainer(TrainerBase):
                 # Get Oracle results
                 search_sent_choice_idx, _, _, _, search_advantage, all_values = self._get_sent_choice_prob_value(
                     batch, sent_idxs, judge_answer_mask, debate_choice_mask, required_text_mask, past_sent_choice_idxs,
-                    stance, sent_answer_idx, num_sents, turn_str, for_training, method.upper(), debate_mode, search_round_no)
+                    stance, sent_answer_idx, num_sents, turn_str, for_training, method.upper(), debate_mode,
+                    search_round_no)
                 if debater.reward_method == 'sl':
                     answer_token_mask_input = ((search_sent_choice_idx == sent_idxs['input']).long() *
                                                batch['valid_output_mask'])
@@ -895,8 +947,10 @@ class Trainer(TrainerBase):
             debate_choice_mask['output'][i, last_output_token_idx] = 1.
             last_input_token_idx = self._output_to_input_idx(batch, i, last_output_token_idx)
             debate_choice_mask['input'][i, last_input_token_idx] = 1.
-        debate_choice_mask['output'] *= (1. - required_text_mask['output'])
-        debate_choice_mask['input'] *= (1. - required_text_mask['input'])
+        debate_choice_mask['output'] = debate_choice_mask['output'] * (1. - required_text_mask['output'])
+        debate_choice_mask['input'] = debate_choice_mask['input'] * (1. - required_text_mask['input'])
+        debate_choice_mask['output'] = debate_choice_mask['output'].long()
+        debate_choice_mask['input'] = debate_choice_mask['input'].long()
         return debate_choice_mask
 
     def _get_num_sents(self, debate_choice_mask: TensorDict) -> torch.Tensor:
@@ -1086,6 +1140,7 @@ class Trainer(TrainerBase):
             if (debater is None) or self.model.update_judge:
                 loss += ver_dict['loss']
 
+            '''
             # Add Loss: RL agents
             for round_turn_no, method in enumerate(debate_mode[round_no]):
                 # Log rewards and stats for all methods
@@ -1167,6 +1222,7 @@ class Trainer(TrainerBase):
 
             prev_round_ver_dict = ver_dict  # Update baseline Judge scores for next round
             turns_completed += len(debate_mode[round_no])
+            '''
 
         if self._eval_mode:
             self._log_debate(batch, sent_idxs, ver_dicts, sent_choice_idxs, debate_mode, stances, num_sents, advantage,
@@ -1239,7 +1295,7 @@ class Trainer(TrainerBase):
                                             num_epochs=1,
                                             shuffle=self.shuffle)
         train_generator = lazy_groups_of(raw_train_generator, num_gpus)
-        num_training_batches = math.ceil(self.iterator.get_num_batches(self.train_data)/num_gpus)
+        num_training_batches = math.ceil(self.iterator.get_num_batches(self.train_data) / num_gpus)
         self._last_log = time.time()
         last_save_time = time.time()
 
@@ -1323,24 +1379,24 @@ class Trainer(TrainerBase):
                 cur_batch = sum([training_util.get_batch_size(batch) for batch in batch_group])
                 cumulative_batch_size += cur_batch
                 if (grad_steps_this_epoch - 1) % self._log_batch_size_period == 0:
-                    average = cumulative_batch_size/grad_steps_this_epoch
+                    average = cumulative_batch_size / grad_steps_this_epoch
                     logger.info(f"current batch size: {cur_batch} mean batch size: {average}")
                     self._tensorboard.add_train_scalar("current_batch_size", cur_batch)
                     self._tensorboard.add_train_scalar("mean_batch_size", average)
 
             # Save model if needed.
             if self._model_save_interval is not None and (
-                    time.time() - last_save_time > self._model_save_interval
+                            time.time() - last_save_time > self._model_save_interval
             ):
                 last_save_time = time.time()
                 self._save_checkpoint(
-                        '{0}.{1}'.format(epoch, training_util.time_to_str(int(last_save_time)))
+                    '{0}.{1}'.format(epoch, training_util.time_to_str(int(last_save_time)))
                 )
         metrics = training_util.get_metrics(
             self.model, train_loss, grad_steps_this_epoch, self._trainer_metrics, reset=True)
         metrics['cpu_memory_MB'] = peak_cpu_usage
         for (gpu_num, memory) in gpu_usage:
-            metrics['gpu_'+str(gpu_num)+'_memory_MB'] = memory
+            metrics['gpu_' + str(gpu_num) + '_memory_MB'] = memory
         return metrics
 
     def _validation_loss(self, debate_mode: List[str] = None) -> Tuple[float, int]:
@@ -1363,7 +1419,7 @@ class Trainer(TrainerBase):
 
         raw_val_generator = val_iterator(self._validation_data, num_epochs=1, shuffle=False)
         val_generator = lazy_groups_of(raw_val_generator, num_gpus)
-        num_validation_batches = math.ceil(val_iterator.get_num_batches(self._validation_data)/num_gpus)
+        num_validation_batches = math.ceil(val_iterator.get_num_batches(self._validation_data) / num_gpus)
         val_generator_tqdm = Tqdm.tqdm(val_generator, total=num_validation_batches)
 
         batches_this_epoch = 0
@@ -1421,13 +1477,14 @@ class Trainer(TrainerBase):
                                                     train_metrics['cpu_memory_MB'])
             for key, value in train_metrics.items():
                 if key.startswith('gpu_'):
-                    metrics["peak_"+key] = max(metrics.get("peak_"+key, 0), value)
+                    metrics["peak_" + key] = max(metrics.get("peak_" + key, 0), value)
 
             if self._validation_data is not None:
                 with torch.no_grad():
                     # We have a validation set, so compute all the metrics on it.
                     val_loss, num_batches = self._validation_loss()
-                    val_metrics = training_util.get_metrics(self.model, val_loss, num_batches, self._trainer_metrics, reset=True)
+                    val_metrics = training_util.get_metrics(self.model, val_loss, num_batches, self._trainer_metrics,
+                                                            reset=True)
 
                     # Check validation metric for early stopping
                     if not self._eval_mode:
@@ -1493,7 +1550,7 @@ class Trainer(TrainerBase):
             if epoch < self._num_epochs - 1:
                 training_elapsed_time = time.time() - training_start_time
                 estimated_time_remaining = training_elapsed_time * \
-                    ((self._num_epochs - epoch_counter) / float(epoch - epoch_counter + 1) - 1)
+                                           ((self._num_epochs - epoch_counter) / float(epoch - epoch_counter + 1) - 1)
                 formatted_time = str(datetime.timedelta(seconds=int(estimated_time_remaining)))
                 logger.info("Estimated training time remaining: %s", formatted_time)
 
@@ -1519,22 +1576,22 @@ class Trainer(TrainerBase):
         """
         # These are the training states we need to persist.
         training_states = {
-                "metric_tracker": self._metric_tracker.state_dict(),
-                "optimizer": self.optimizer.state_dict(),
-                "batch_num_total": self._batch_num_total
+            "metric_tracker": self._metric_tracker.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+            "batch_num_total": self._batch_num_total
         }
 
         # If we have a learning rate scheduler, we should persist that too.
         if self._learning_rate_scheduler is not None:
             training_states["learning_rate_scheduler"] = (
-                    self._learning_rate_scheduler.lr_scheduler.state_dict()
+                self._learning_rate_scheduler.lr_scheduler.state_dict()
             )
 
         self._checkpointer.save_checkpoint(
-                model_state=self.model.state_dict(),
-                epoch=epoch,
-                training_states=training_states,
-                is_best_so_far=self._metric_tracker.is_best_so_far())
+            model_state=self.model.state_dict(),
+            epoch=epoch,
+            training_states=training_states,
+            is_best_so_far=self._metric_tracker.is_best_so_far())
 
     def _restore_checkpoint(self) -> int:
         """
@@ -1651,7 +1708,7 @@ class Trainer(TrainerBase):
 
         num_serialized_models_to_keep = params.pop_int("num_serialized_models_to_keep", 20)
         keep_serialized_model_every_num_seconds = params.pop_int(
-                "keep_serialized_model_every_num_seconds", None)
+            "keep_serialized_model_every_num_seconds", None)
         model_save_interval = params.pop_float("model_save_interval", None)
         summary_interval = params.pop_int("summary_interval", 100)
         histogram_interval = params.pop_int("histogram_interval", None)
@@ -1741,10 +1798,10 @@ class TrainerPieces(NamedTuple):
             vocab = Vocabulary.from_files(os.path.join(serialization_dir, "vocabulary"))
         else:
             vocab = Vocabulary.from_params(
-                    params.pop("vocabulary", {}),
-                    (instance for key, dataset in all_datasets.items()
-                     for instance in dataset
-                     if key in datasets_for_vocab_creation)
+                params.pop("vocabulary", {}),
+                (instance for key, dataset in all_datasets.items()
+                 for instance in dataset
+                 if key in datasets_for_vocab_creation)
             )
 
         # Debate: Load judge model from archive (if applicable)
